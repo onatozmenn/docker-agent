@@ -404,24 +404,60 @@ func TestMessageMergeProbeRegistrySupportsDMR(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []mergeProbeTarget{{Provider: "dmr", Model: "ai/qwen3:latest"}}, targets)
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/chat/completions") {
-			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = w.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
-			return
-		}
-		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer server.Close()
+	scenario := messageMergeProbeScenarios()[1]
+	for _, variant := range messageMergeProbeVariants(t.Context(), scenario) {
+		t.Run(variant.Name, func(t *testing.T) {
+			t.Parallel()
 
-	p, err := fullTestRegistry().New(t.Context(), &latest.ModelConfig{
-		Provider: "dmr",
-		Model:    "ai/qwen3:latest",
-		BaseURL:  server.URL + "/engines/v1/",
-	}, environment.NewNoEnvProvider())
-	require.NoError(t, err)
-	closeProvider(p)
+			var serverRequests atomic.Int32
+			captured := make(chan []byte, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				serverRequests.Add(1)
+				if r.URL.Path != "/engines/v1/chat/completions" {
+					t.Errorf("unexpected setup request reached endpoint: %s", r.URL.Path)
+					http.Error(w, "unexpected path", http.StatusBadRequest)
+					return
+				}
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("reading probe request: %v", err)
+					http.Error(w, "invalid body", http.StatusBadRequest)
+					return
+				}
+				captured <- body
+				resp := messageMergeSSEResponse(r)
+				defer resp.Body.Close()
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, err = io.Copy(w, resp.Body)
+				assert.NoError(t, err)
+			}))
+			defer server.Close()
+
+			transport := newMergeProbeTransport(variant.Messages)
+			p, err := newMergeProbeProvider(t.Context(), &latest.ModelConfig{
+				Provider: "dmr",
+				Model:    "ai/qwen3:latest",
+				BaseURL:  server.URL + "/engines/v1/",
+			}, environment.NewNoEnvProvider(), transport)
+			require.NoError(t, err)
+			defer closeProvider(p)
+
+			result := collectMessageMergeProbe(t.Context(), p, transport, targets[0], scenario, variant)
+			require.Equal(t, mergeProbeAccepted, result.Outcome)
+			assert.Equal(t, "/engines/v1/chat/completions", result.APIPath)
+			assert.Equal(t, http.StatusOK, result.Status)
+			assert.Equal(t, 1, result.Requests)
+			assert.Equal(t, 1, result.Attempts)
+			assert.Zero(t, result.Blocked)
+			assert.Equal(t, int32(1), serverRequests.Load())
+
+			var payload struct {
+				Messages []json.RawMessage `json:"messages"`
+			}
+			require.NoError(t, json.Unmarshal(<-captured, &payload))
+			assert.JSONEq(t, mustMarshalOpenAIMessages(t, variant.Messages), string(mustMarshalRawMessages(t, payload.Messages)))
+		})
+	}
 }
 
 func runMessageMergeProbe(t *testing.T, target mergeProbeTarget) {
@@ -460,16 +496,12 @@ func executeMessageMergeProbe(ctx context.Context, target mergeProbeTarget, scen
 	maxTokens := int64(256)
 	temperature := 0.0
 	transport := newMergeProbeTransport(variant.Messages)
-	p, err := fullTestRegistry().New(ctx, &latest.ModelConfig{
+	p, err := newMergeProbeProvider(ctx, &latest.ModelConfig{
 		Provider:    target.Provider,
 		Model:       target.Model,
 		MaxTokens:   &maxTokens,
 		Temperature: &temperature,
-	}, environment.NewOsEnvProvider(),
-		options.WithHTTPTransportWrapper(func(base http.RoundTripper) http.RoundTripper {
-			transport.base = base
-			return transport
-		}))
+	}, environment.NewOsEnvProvider(), transport)
 	if err != nil {
 		result.Outcome = mergeProbeSetupError
 		result.Notes = "provider_setup_failed"
@@ -478,6 +510,27 @@ func executeMessageMergeProbe(ctx context.Context, target mergeProbeTarget, scen
 	defer closeProvider(p)
 
 	return collectMessageMergeProbe(ctx, p, transport, target, scenario, variant), nil
+}
+
+func newMergeProbeProvider(ctx context.Context, cfg *latest.ModelConfig, env environment.Provider, transport *mergeProbeTransport) (Provider, error) {
+	var ready atomic.Bool
+	p, err := fullTestRegistry().New(ctx, cfg, env,
+		options.WithHTTPTransportWrapper(func(base http.RoundTripper) http.RoundTripper {
+			transport.base = base
+			return mergeProbeRoundTripper(func(req *http.Request) (*http.Response, error) {
+				// DMR configures its model during construction; setup calls must
+				// neither reach the endpoint nor mark the inference as off-path.
+				if !ready.Load() {
+					return nil, errors.New("message-merge probe blocks HTTP requests during provider setup")
+				}
+				return transport.RoundTrip(req)
+			})
+		}))
+	if err != nil {
+		return nil, err
+	}
+	ready.Store(true)
+	return p, nil
 }
 
 func collectMessageMergeProbe(ctx context.Context, p Provider, transport *mergeProbeTransport, target mergeProbeTarget, scenario mergeProbeScenario, variant mergeProbeVariant) mergeProbeResult {
