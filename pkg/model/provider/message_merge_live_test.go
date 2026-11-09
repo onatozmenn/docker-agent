@@ -567,6 +567,7 @@ func executeMessageMergeProbe(ctx context.Context, target mergeProbeTarget, scen
 func newMergeProbeProvider(ctx context.Context, cfg *latest.ModelConfig, env environment.Provider, transport *mergeProbeTransport) (Provider, error) {
 	var ready atomic.Bool
 	p, err := fullTestRegistry().New(ctx, cfg, env,
+		// A probe must never download a model during provider construction.
 		options.WithDisableAutoPull(),
 		options.WithHTTPTransportWrapper(func(base http.RoundTripper) http.RoundTripper {
 			transport.base = base
