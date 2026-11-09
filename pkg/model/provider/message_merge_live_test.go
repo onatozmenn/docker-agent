@@ -11,7 +11,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"regexp"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -211,6 +213,8 @@ func TestMessageMergeLive(t *testing.T) {
 	}
 	require.NoError(t, err)
 
+	require.NoError(t, validateMergeProbeCommit(mergeProbeCommit()))
+
 	for _, target := range targets {
 		t.Run(target.String(), func(t *testing.T) {
 			runMessageMergeProbe(t, target)
@@ -282,6 +286,54 @@ func TestMessageMergeLiveRequiresExplicitOptIn(t *testing.T) {
 			}
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, targets)
+		})
+	}
+}
+
+func TestValidateMergeProbeCommit(t *testing.T) {
+	t.Parallel()
+
+	require.Error(t, validateMergeProbeCommit(""))
+	require.Error(t, validateMergeProbeCommit("unknown"))
+	require.NoError(t, validateMergeProbeCommit("86de60512f90e7f2748bd9c93e0c4ffafd2d2cb3"))
+}
+
+func TestRedactMergeProbeAPIPath(t *testing.T) {
+	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "account-123")
+	t.Setenv("CLOUDFLARE_GATEWAY_ID", "gateway-456")
+
+	tests := []struct {
+		name     string
+		provider string
+		path     string
+		want     string
+	}{
+		{
+			name:     "workers ai account id",
+			provider: "cloudflare-workers-ai",
+			path:     "/client/v4/accounts/account-123/ai/v1/chat/completions",
+			want:     "/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/ai/v1/chat/completions",
+		},
+		{
+			name:     "ai gateway account and gateway ids",
+			provider: "cloudflare-ai-gateway",
+			path:     "/v1/account-123/gateway-456/compat/chat/completions",
+			want:     "/v1/${CLOUDFLARE_ACCOUNT_ID}/${CLOUDFLARE_GATEWAY_ID}/compat/chat/completions",
+		},
+		{
+			name:     "provider without environment references",
+			provider: "deepseek",
+			path:     "/v1/chat/completions",
+			want:     "/v1/chat/completions",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := redactMergeProbeAPIPath(tt.provider, tt.path)
+			assert.Equal(t, tt.want, got)
+			assert.NotContains(t, got, "account-123")
+			assert.NotContains(t, got, "gateway-456")
 		})
 	}
 }
@@ -515,6 +567,7 @@ func executeMessageMergeProbe(ctx context.Context, target mergeProbeTarget, scen
 func newMergeProbeProvider(ctx context.Context, cfg *latest.ModelConfig, env environment.Provider, transport *mergeProbeTransport) (Provider, error) {
 	var ready atomic.Bool
 	p, err := fullTestRegistry().New(ctx, cfg, env,
+		options.WithDisableAutoPull(),
 		options.WithHTTPTransportWrapper(func(base http.RoundTripper) http.RoundTripper {
 			transport.base = base
 			return mergeProbeRoundTripper(func(req *http.Request) (*http.Response, error) {
@@ -545,13 +598,17 @@ func collectMessageMergeProbe(ctx context.Context, p Provider, transport *mergeP
 	stream, err := p.CreateChatCompletionStream(ctx, scenario.Messages, nil)
 	if err != nil {
 		result.Outcome = classifyMergeProbeError(transport, err)
-		result.APIPath, result.Requests, result.Attempts, result.Blocked, result.Status = transport.snapshot()
+		path, requests, attempts, blocked, status := transport.snapshot()
+		result.APIPath = redactMergeProbeAPIPath(target.Provider, path)
+		result.Requests, result.Attempts, result.Blocked, result.Status = requests, attempts, blocked, status
 		return result
 	}
 	defer stream.Close()
 
 	content, finish, usage, recvErr := consumeMergeProbeStream(stream)
-	result.APIPath, result.Requests, result.Attempts, result.Blocked, result.Status = transport.snapshot()
+	path, requests, attempts, blocked, status := transport.snapshot()
+	result.APIPath = redactMergeProbeAPIPath(target.Provider, path)
+	result.Requests, result.Attempts, result.Blocked, result.Status = requests, attempts, blocked, status
 	result.Outcome = classifyMergeProbe(transport, recvErr, content, finish)
 	result.StreamEnd = mergeProbeStreamEnd(finish, recvErr)
 	result.MarkersOK = containsAllMarkers(content, scenario.Markers)
@@ -581,6 +638,25 @@ func recordMergeProbeResult(t *testing.T, result mergeProbeResult) {
 	defer f.Close()
 	_, err = f.Write(append(data, '\n'))
 	require.NoError(t, err)
+}
+
+var mergeProbeEnvRefPattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// redactMergeProbeAPIPath replaces expanded catalog environment values (for
+// example a Cloudflare account id) with their `${NAME}` placeholders before
+// the path is logged or written to JSONL.
+func redactMergeProbeAPIPath(provider, path string) string {
+	for _, match := range mergeProbeEnvRefPattern.FindAllStringSubmatch(catalog.Lookup(provider).BaseURL, -1) {
+		name := match[1]
+		value := strings.TrimSpace(os.Getenv(name))
+		if value == "" {
+			continue
+		}
+		placeholder := "${" + name + "}"
+		path = strings.ReplaceAll(path, value, placeholder)
+		path = strings.ReplaceAll(path, url.PathEscape(value), placeholder)
+	}
+	return path
 }
 
 func classifyMergeProbeError(transport *mergeProbeTransport, err error) string {
@@ -892,6 +968,13 @@ func mergeProbeCommit() string {
 		}
 	}
 	return "unknown"
+}
+
+func validateMergeProbeCommit(commit string) error {
+	if commit == "" || commit == "unknown" {
+		return errors.New("message-merge probes require VCS metadata; run go test with -buildvcs=true")
+	}
+	return nil
 }
 
 func messageRoles(messages []openai.ChatCompletionMessageParamUnion) []string {
