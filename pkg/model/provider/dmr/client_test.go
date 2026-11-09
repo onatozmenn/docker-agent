@@ -1373,7 +1373,8 @@ func TestNewClientAvailabilityCheckBypassesTransportWrapper(t *testing.T) {
 		}),
 	)
 	require.NoError(t, err)
-	assert.Equal(t, int32(1), serverRequests.Load())
+	// One /models probe from endpoint discovery and one from availability.
+	assert.Equal(t, int32(2), serverRequests.Load())
 	assert.Zero(t, wrapperCalls.Load())
 }
 
