@@ -38,7 +38,7 @@ import (
 
 // The probes below are an experiment harness, not a compatibility guarantee.
 // They are disabled by default and only run when both an explicit opt-in and a
-// target list are present. See docs/community/contributing/message-merging.md.
+// target list are present. See docs/community/message-merging/index.md.
 const (
 	messageMergeLiveOptInEnv  = "DOCKER_AGENT_RUN_MESSAGE_MERGE_LIVE_TESTS"
 	messageMergeTargetsEnv    = "DOCKER_AGENT_MESSAGE_MERGE_TARGETS"
