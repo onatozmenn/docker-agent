@@ -730,7 +730,7 @@ func mergeProbeErrorClass(err error) string {
 }
 
 func mentionsRoleOrTemplate(lowerBody string) bool {
-	for _, needle := range []string{"system message", "system role", "must be at the beginning", "chat template", "template"} {
+	for _, needle := range []string{"system message", "system role", "roles must alternate", "must be at the beginning", "chat template", "template"} {
 		if strings.Contains(lowerBody, needle) {
 			return true
 		}
@@ -1051,6 +1051,24 @@ func TestClassifyMergeProbe(t *testing.T) {
 			transport: statusTransport(http.StatusBadRequest, "System message must be at the beginning"),
 			err:       errors.New("bad request"),
 			want:      mergeProbeRoleRejected,
+		},
+		{
+			name:      "role alternation rejected",
+			transport: statusTransport(http.StatusBadRequest, `{"error":{"message":"Conversation roles must alternate user/assistant/user/assistant/..."}}`),
+			err:       errors.New("bad request"),
+			want:      mergeProbeRoleRejected,
+		},
+		{
+			name:      "role alternation rejected after retry budget exhaustion",
+			transport: statusTransport(http.StatusBadRequest, "Conversation roles must alternate user/assistant/user/assistant/..."),
+			err:       fmt.Errorf("retry blocked: %w", errMergeProbeBudgetExhausted),
+			want:      mergeProbeRoleRejected,
+		},
+		{
+			name:      "unrelated role field error",
+			transport: statusTransport(http.StatusBadRequest, "The role field must be a string"),
+			err:       errors.New("bad request"),
+			want:      mergeProbeEndpointError,
 		},
 		{
 			name:      "endpoint error",
